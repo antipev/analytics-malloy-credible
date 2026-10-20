@@ -1,0 +1,8 @@
+
+import '../1_sources/users.malloy_hidden'
+
+#(doc) "Customer profile data containing demographic information and contact details."
+source: users is users_source extend {
+
+  
+}

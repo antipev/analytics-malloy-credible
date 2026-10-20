@@ -1,0 +1,7 @@
+
+import '../1_sources/event_session_funnel.malloy_hidden'
+
+
+source: event_session_funnel is event_session_funnel_source extend {
+  
+}

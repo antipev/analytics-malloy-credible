@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>2026 Gross Margin by Month</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; max-width: 960px; margin: 32px auto; padding: 0 24px; color: #1f2937; }
+  h1 { font-size: 1.75rem; margin-bottom: 0.25rem; }
+  .subtitle { color: #6b7280; margin-bottom: 2rem; }
+  .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+  h2 { font-size: 1.15rem; margin-top: 0; margin-bottom: 1rem; color: #111827; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #e5e7eb; }
+  th { background: #f9fafb; color: #374151; font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .caveat { background: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px 16px; border-radius: 4px; margin-top: 16px; font-size: 0.9rem; }
+  ul.observations { padding-left: 20px; line-height: 1.6; }
+  ul.observations li { margin-bottom: 10px; }
+  .canvas-wrap { position: relative; height: 360px; }
+</style>
+</head>
+<body>
+<h1>2026 Gross Margin by Month</h1>
+<div class="subtitle">Total Gross Margin sliced by transaction date (<code>order_items.Created_at</code>). May 2026 is partial — through May 25.</div>
+
+<div class="card">
+  <h2>Monthly trend</h2>
+  <div class="canvas-wrap"><canvas id="trendChart"></canvas></div>
+</div>
+
+<div class="card">
+  <h2>Monthly detail</h2>
+  <table>
+    <thead><tr><th>Month</th><th class="num">Total Gross Margin</th></tr></thead>
+    <tbody>
+      <tr><td>Jan 2026</td><td class="num">$190,343</td></tr>
+      <tr><td>Feb 2026</td><td class="num">$175,138</td></tr>
+      <tr><td>Mar 2026</td><td class="num">$229,645</td></tr>
+      <tr><td>Apr 2026</td><td class="num">$256,063</td></tr>
+      <tr><td>May 2026 (partial)</td><td class="num">$432,171</td></tr>
+    </tbody>
+  </table>
+  <div class="caveat"><strong>Caveat:</strong> May 2026 reflects partial data through May 25, 2026. Other months represent full-month totals.</div>
+</div>
+
+<div class="card">
+  <h2>Observations</h2>
+  <ul class="observations">
+    <li><strong>Steady acceleration through the year.</strong> After a small dip from $190K in January to $175K in February (-8%), margin grew every month: $230K in March (+31% vs Feb), $256K in April (+12% vs Mar).</li>
+    <li><strong>May is on pace for a sharp jump.</strong> Through just May 25, margin already reached <strong>$432K</strong> — about 69% above April's full-month total — with roughly a week of the month still to come. Linear extrapolation puts the full month near <strong>$535K</strong>.</li>
+    <li><strong>Net direction:</strong> the business is in clear upward momentum, with Q2 2026 materially outperforming Q1.</li>
+    <li><strong>Caveat:</strong> May is partial; confirm before treating the jump as a finished result.</li>
+  </ul>
+</div>
+
+<script>
+const fmt = v => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(v);
+new Chart(document.getElementById('trendChart').getContext('2d'), {
+  type: 'line',
+  data: {
+    labels: ['Jan 2026','Feb 2026','Mar 2026','Apr 2026','May 2026 (partial)'],
+    datasets: [{
+      label: 'Total Gross Margin',
+      data: [190343, 175138, 229645, 256063, 432171],
+      borderColor: '#2563eb',
+      backgroundColor: 'rgba(37, 99, 235, 0.1)',
+      borderWidth: 2.5,
+      pointRadius: 5,
+      pointBackgroundColor: '#2563eb',
+      fill: true,
+      tension: 0.25
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: { callbacks: { label: ctx => fmt(ctx.parsed.y) } }
+    },
+    scales: { y: { beginAtZero: true, ticks: { callback: v => fmt(v) } } }
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+##! experimental.access_modifiers
+import '../1_sources/events.malloy_hidden'
+
+
+source: events is events_source include { 
+   *
+   private: users_source
+}

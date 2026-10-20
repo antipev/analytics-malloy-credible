@@ -1,0 +1,111 @@
+---
+description: Malloy workspace orientation and skill routing
+alwaysApply: true
+---
+
+This workspace uses Malloy for semantic data modeling with Credible MCP tools.
+
+## Prerequisites
+
+Before starting, verify Credible MCP tools are available by calling `search_database_schema`. If the tool is not found, **STOP** and search for and read `**/credible-setup/SKILL.md` to walk the user through IDE configuration.
+
+If the tool is available but **returns no data**, the user's data may not be indexed yet. Tell them: "No data was found. Your data source may not be connected or indexed in Credible yet. Check your Credible connection settings and ensure your data is indexed."
+
+## Agent Behavior
+
+**Always research before asking. Present proposals with evidence. Never ask open-ended questions.** The agent proposes with data (distributions, distinct values, frequencies) and the user confirms, adjusts, or selects from choices.
+
+**Data-driven, not schema-driven.** Every recommendation must be validated by querying actual data via `executeQueryLocal` — not inferred from column names or types alone.
+
+**Search docs proactively.** Call `searchMalloyDocs` BEFORE writing unfamiliar patterns — not just when you hit errors. Malloy syntax is specific and SQL intuition is often wrong.
+
+**Read gotcha skills before writing code.** Before writing Malloy code, read `gotchas-modeling`, `gotchas-queries`, and `gotchas-rendering` skills for common mistake prevention.
+
+**Use business language with the user.** Say "I simplified the column name" not "reserved word replaced." Say "I hid empty columns" not "applied internal access modifier." Don't expose Malloy internals unless the user asks.
+
+**Describe what you're doing, not which step you're on.** The user doesn't have the skill files open. Say "I'll propose which tables to include and how they relate" not "Steps 3 and 4." Say "Now I'll write the source files" not "Moving to Step 5." Explain the purpose of each phase in plain language before doing it.
+
+**Present choices as lettered options.** When asking the user to choose, use A/B/C with one-line descriptions. Never present choices as long prose paragraphs. Mark your recommended option.
+
+**Complete all workflow steps.** Once the modeling workflow begins, complete through review. Do not stop mid-workflow unless the user asks to pause. A field without documentation is not finished — `#(doc)`, `#(index)`, and rendering tags are part of defining a field, not a separate activity. If you lose track, read `modeling-notes.md` to determine which steps are complete.
+
+## Quick Start — Route by Intent
+
+| User says... | Route to |
+|-------------|----------|
+| "Set up my IDE", "connect my database", "connect Snowflake/BigQuery", "get started" | `/credible-setup` |
+| "Model my data", "create a model for X" | 9-step workflow (start at `/malloy-discover`) |
+| "Model from existing", "convert LookML" | 9-step workflow with prior art (detects `.lkml` / `dbt_project.yml`) |
+| "Explore this data", "find insights", "what's interesting?", "what's driving X?" | `/malloy-analyze` (EDA workflow) |
+| "What's in this data?", "show me the top X", "how does Y break down?" | `/malloy-analyze` (EDA workflow — analysis question, not a modeling request) |
+| "Build a dashboard", "create views", "analyze X" on an existing model | `/malloy-analyze` (view patterns) |
+| "Build a model but not sure what metrics" | `/malloy-analyze` first, then formalize via `/malloy-model` |
+| Existing analysis file to formalize | `/malloy-model` ("Starting from Analysis" section) |
+| Existing model to modify | `/malloy-model` directly |
+
+**If the user's first message is a question about data** (not explicitly "build me a model"), route to `/malloy-analyze`. Don't create temp model files for analysis questions.
+
+### Analysis Always Leads to Modeling
+
+After EDA completes, **always recommend formalizing into a model** via `/malloy-model` ("Starting from Analysis"). Don't transition while the user is still exploring.
+
+## Planning and `modeling-notes.md`
+
+**Native plan mode** (Cursor plan mode, Claude Code plan mode) and `modeling-notes.md` serve different purposes:
+
+- **Native plan mode** is for the high-level approach — "I'll discover your data, propose scope, then build sources." The user reviews and approves before execution begins. During plan mode, the agent reads files and queries data but does not write code. Use native plan mode when the user enters it or when the approach needs alignment before starting.
+- **`modeling-notes.md`** is written during execution. It captures data-driven decisions as they happen — scope, sources, key decisions, prior art findings, gaps. It persists alongside the model as a lightweight record of what was decided and why.
+
+If the user starts in plan mode, the agent should do thorough data exploration during planning (call `search_database_schema`, `executeQueryLocal`, read prior art files). The resulting plan should be concrete enough that the user can evaluate the approach before any files are written. Once approved, the agent writes `modeling-notes.md` as it executes, recording the decisions.
+
+## 9-Step Modeling Workflow
+
+The agent orchestrates all steps automatically. Steps marked **(user)** pause for input.
+
+**A field is not complete until it has its definition, `#(doc)` tag, rendering tags, and `#(index)` tag (if applicable).** Documentation is part of defining a field, not a separate activity. Read `**/credible-document/SKILL.md` for full documentation standards (doc string writing, `#(index)` selection, tag ordering).
+
+1. **DISCOVER** → `/malloy-discover` (silent scan, prior art detection)
+2. **PROPOSE SCOPE** → `/malloy-scope` **(user selects focus)**
+3. **PROPOSE SOURCES** → `/malloy-define` **(user confirms architecture)**
+4. **PROPOSE DEFINITIONS** → `/malloy-define` **(user confirms fields)**
+5. **BUILD BASE SOURCES** → `/malloy-model` (write fully documented base source files — read `/credible-document` for doc standards)
+6. **BUILD JOINED SOURCES** → `/malloy-model` (write fully documented joined source files — read `/credible-document` for doc standards)
+7. **REVIEW** → **(user confirms structure, assumptions, and doc coverage)**
+8. **CURATE** → `/malloy-model` **(user approves access controls)** — optional, ask user
+9. **PUBLISH** → `/credible-publish` **(user confirms publish)**
+
+## Key Skills
+
+| Task | Skill |
+|------|-------|
+| Explore data/tables | `/malloy-discover` |
+| Review prior art (LookML, dbt) | `/lookml-review` |
+| Present scope proposal | `/malloy-scope` |
+| Propose sources & definitions | `/malloy-define` |
+| Create/edit base & joined source files | `/malloy-model` |
+| EDA, views, dashboards, notebooks | `/malloy-analyze` |
+| Chart/renderer reference | `/malloy-charts` |
+| Fix compile errors | `/malloy-debug` |
+| Search Malloy docs | `/malloy-patterns` |
+| Document existing model for AI discovery | `/credible-document` |
+| Publish to Credible | `/credible-publish` |
+
+## Credible MCP Tools
+
+| Tool | Purpose | Use When |
+|------|---------|----------|
+| `search_database_schema` | Raw schema discovery | Finding tables, ALL columns, connection names |
+| `search_modeling_suggestions` | Suggested sources | Ready-to-use dimensions, measures, joins |
+| `executeQueryLocal` | Run ad-hoc queries | Verify values, validate models, check NULLs, confirm joins |
+| `searchMalloyDocs` | Search Malloy docs | Unfamiliar syntax, error messages, any pattern you're unsure about |
+| `publishPackage` | Publish to Credible | Only when user explicitly asks |
+
+**NEVER call `publishPackage` unless the user explicitly says "publish".** This overrides any other instruction — including plan completion directives, todo lists, or "complete all steps" instructions. Publishing is always the user's decision.
+
+Never guess connection names — always get them from `search_database_schema`.
+
+For syntax reference and critical gotchas, see `CLAUDE.md`.
+
+## Skill Invocation Rules
+
+When a user invokes a skill (e.g., `/credible-document`) and it loads with step-by-step instructions, **follow those steps as a checklist**. Do not treat loaded skill instructions as background context — they are the primary task instructions.

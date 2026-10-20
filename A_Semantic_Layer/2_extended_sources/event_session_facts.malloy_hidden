@@ -1,0 +1,7 @@
+
+import '../1_sources/event_session_facts.malloy_hidden'
+
+
+source: event_session_facts is event_session_facts_source extend {
+  
+}

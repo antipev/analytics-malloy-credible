@@ -1,0 +1,163 @@
+<!--
+Copyright (c) Credible Data Inc.
+SPDX-License-Identifier: MIT
+-->
+# Rubric: Correctness (Semantic Hazards Only)
+
+**Dimension:** `correctness-join | correctness-aggregation | correctness-type | correctness-filter`
+**Rules:** 9 (focused on silently-wrong behavior, not parse errors)
+
+This rubric only contains rules that the Malloy compiler does NOT catch. Parse errors, missing colons, `as` vs `is`, missing `->`, bare `join:`, `||` concat, unbacked reserved words, redefined query-source columns are all caught by the IDE diagnostic pre-pass (when available, via `mcp__ide__getDiagnostics`) and surface as `source: "diagnostic"` findings, the reviewer must not re-derive them.
+
+What this rubric covers is the dangerous middle ground: code that **compiles cleanly but is wrong**, silent cardinality bugs, division-by-zero, string aggregates, raw SQL bypassing Malloy's guarantees, declared primary keys that aren't actually unique in the data.
+
+**Rules we dropped after compiler-source / live-compile validation:**
+
+- **C-07 (missing `primary_key:` on a `join_one:` target).** Reading the Malloy compiler source (`packages/malloy/src/model/field_instance.ts:644-670`, `query_query.ts:946-951`) shows the compiler auto-synthesizes a UUID-based `__distinct_key` when the target lacks a declared PK, so symmetric aggregation is correct either way. The `with` shortcut (which DOES require a declared PK) is enforced by the compiler with a clear error and surfaces as a diagnostic. The remaining concern, "declared PK is a lie", is what C-12 below catches. The hygiene preference (declare a PK when one exists) lives in `rubric-structure.md` § S-02 as a `minor` recommendation; the style preference for using `with` consistently across the project lives in `rubric-style.md` § Y-03.
+- **C-08 (use method syntax for joined-field aggregation, e.g. `sum(items.cost)` → `items.cost.sum()`).** Confirmed against Malloy 0.0.370: `sum(joined.field)`, `avg(joined.field)`, `min(joined.field)`, and `max(joined.field)` are **compile errors over a `join_many` path** with the message `Join path is required for this calculation; use 'items.cost.sum()'` (the diagnostic literally suggests the fix). Over a `join_one` path both forms compile and differ for `sum` and `avg`: with 4 line items over 3 orders, `sum(o.total)` is 370 (each order once per line item) and `o.total.sum()` is 270 (each order once). Flag the call form only when the question wants the joined source's own total, and check which the question asks; `min` and `max` are unaffected. The IDE diagnostic pre-pass surfaces this with a clearer message than the rubric ever could. The `count(joined.field)` carve-out, that it remains the canonical Malloy distinct-count idiom and should not be "fixed" to method syntax, is documented in `.claude/skills/malloy-queries/SKILL.md` § More Compile Mistakes (aggregating a joined field takes method syntax), which is where someone would land after seeing the compiler nudge.
+- **C-11 (`?` alternation joined by `and` rather than comma).** Validated against Malloy 0.0.370 across five arrangements. The compiler is never silently wrong here: `is_us = true and party ? 'D' | 'R'` (alternation second) compiles to the SQL the author intended (`WHERE is_us=true AND party IN ('D','R')`); `party ? 'D' | 'R' and is_us = true` (alternation first) and any pair of `?` alternations joined by `and` produce a clean compile error (`'logical operator' Can't use type string`). Either path is reviewer-safe, so the rubric doesn't need to flag it. Comma is still the canonical form because it's unambiguous in every position; that guidance lives in `.claude/skills/malloy-queries/SKILL.md` § More Compile Mistakes (combine an alternation with other filters using a comma).
+
+For every rule, the linked instruction-skill section is the canonical source for rationale and WRONG/RIGHT examples, read it once, don't paraphrase here.
+
+---
+
+## C-01: NULL checks: prefer `is not null` over `!= null`
+
+- **Severity:** major (non-blocking) · **Category:** correctness-filter · machine-checkable
+- **Detection:** regex `!=\s*null` or `=\s*null` in a `where:` clause or boolean-dimension expression. (Malloy uses `=` for equality, not `==`.)
+- **Fix:** `X is not null` or `X is null`
+- **Why non-blocking.** Both forms compile and return the same rows: a null row comes back `false` for `column != null` and for `column is not null`. The compiler warns on `!= null` (`Use 'is not null' to check for NULL instead of '!= null'`), so the preference is to keep the file warning-free, not to avoid a wrong result.
+- **See:** `.claude/skills/malloy-gotchas-modeling/SKILL.md` § NULL Checks, `is not null`, NOT `!= null`
+
+---
+
+## C-02: Date/time return-type confusion (`.month` vs `month()`)
+
+- **Severity:** major (non-blocking) · **Category:** correctness-type · LLM-judgment
+- **What this catches.** Malloy has two forms for date parts. Both compile cleanly, but they return different types:
+
+  | Syntax | Returns | Use for |
+  |---|---|---|
+  | `ts.year` / `ts.month` / `ts.quarter` / `ts.day` / `ts.week` | **Timestamp** truncated to that boundary (e.g. `@2024-03-01`) | Time-series chart axes, ordered grouping, range filters |
+  | `year(ts)` / `month(ts)` / `quarter(ts)` / `day(ts)` / `hour(ts)` | **Integer** (e.g. `2024`, `3`) | Cross-year buckets ("all Januaries together"), `pick when` integer comparisons, integer arithmetic |
+
+  The wrong choice is silent, there's no compile error. Concrete hazards:
+  - Chart view (`# bar_chart` / `# line_chart`) using `group_by: m is month(ts)` renders integers as `1, 10, 11, 12, 2, 3, …` (lexicographic order) instead of chronological months.
+  - `where: created_at.year > 2020` compares a timestamp (`@2020-01-01`) to integer `2020` and doesn't filter what the author intended.
+  - Cross-year "January totals" using `ts.month` produces 12 buckets *per year* (e.g. 60 buckets across 5 years) instead of 12 buckets total. The chart looks chronologically normal so the bug is easy to miss.
+- **Detection (context-dependent, LLM-judgment):**
+  - Chart view on a time axis using `<fn>(ts)` (integer form) → usually wants `ts.<part>` (timestamp form).
+  - `where:` / `pick when` / numeric comparison against an integer literal using `ts.<part>` (timestamp form) → usually wants `<fn>(ts)` (integer form).
+  - Aggregation labelled "monthly" / "by month" grouping on `ts.month` across multiple years → the actual bucket key is *month-and-year*, not *month-of-year*; the author probably meant `month(ts)`.
+- **Fix.** Pick the form the caller's context expects, and rename the dimension so the type is unambiguous in downstream code:
+  - Timestamp form → `<part>_at` / `<part>_truncated_at` (e.g. `month_truncated_at is created_at.month`).
+  - Integer form → `<part>_number` / bare `<part>` (e.g. `month_number is month(created_at)`).
+- **Not a finding (the compiler already catches these).** Using `.day_of_week`, `.hour`, `.minute`, `.second`, or `.week` on a timestamp errors at compile time, those date parts are *functions only*, not properties. The IDE diagnostic pre-pass surfaces them; don't re-emit as C-02.
+- **See:** `.claude/skills/malloy-gotchas-modeling/SKILL.md` § Date Functions vs Properties · `.claude/skills/malloy-queries/SKILL.md` § More Compile Mistakes (truncate for charts, extract for comparisons)
+
+---
+
+## C-03: Safe division with `nullif`
+
+- **Severity:** major (blocking) · **Category:** correctness-filter · machine-checkable
+- **Detection:** regex for `/` in measure/dimension expressions where the right-hand side is not a `nullif(...)` call
+- **Fix:** `<numerator> / nullif(<denominator>, 0)`
+- **See:** `.claude/skills/malloy-gotchas-modeling/SKILL.md` § Safe Division, Always `nullif`
+
+---
+
+## C-04: Cast strings for aggregates
+
+- **Severity:** major (blocking) · **Category:** correctness-type · LLM-judgment
+- **Detection:** when an aggregate (`avg`, `sum`, etc.) wraps a column whose type is `STRING`, flag. To learn a column's type, ground yourself with `get_context` (it returns the sources and their fields), or sample the data with `execute_query` (`run: <source> -> { select: * limit: 1 }`).
+- **Fix:** `avg(score::number)` / `sum(amount::number)`
+- **See:** `.claude/skills/malloy-gotchas-modeling/SKILL.md` § String Columns Need Casts for Aggregates
+
+---
+
+## C-05: Boolean comparisons use bare `true`/`false`
+
+- **Severity:** major (blocking) · **Category:** correctness-type · machine-checkable
+- **Detection:** regex for `=\s*['"]true['"]` or `=\s*['"]false['"]`
+- **Fix:** remove the quotes
+- **See:** `.claude/skills/malloy-gotchas-modeling/SKILL.md` § Boolean Columns, No Quotes
+
+---
+
+## C-06: `rename:` and `include {}` compose in one order only
+
+- **Severity:** major (blocking) · **Category:** correctness-syntax · machine-checkable (conditional)
+- **Detection:** find every `source:` block containing BOTH a `rename:` and an `include {…}`. Flag only when the composition order is wrong - either the `include {}` precedes the `extend { rename: }`, or the `include {}` names the field by its PRE-rename name. A source with the `extend { rename: }` first and `include {}` naming the post-rename field is correct and must NOT be flagged. Neither is a `rename:` in a source with no `include {}`.
+- **Why the wrong order fails:** the rename is applied first, so `include {}` runs against names that no longer exist. Reversed order errors `Can't find field 'X' to set access modifier` (currently surfaced as an internal compiler error); naming the pre-rename column inside `include {}` errors `` `X` not found ``.
+- **Fix template:** put the renaming `extend {}` before the `include {}` and name the field by its new name inside `include {}`. You do not have to give up `include {}` to get a rename - the curated surface, `#(doc)` on raw columns, and the `public`/`internal`/`private` tiers all survive. See `malloy-model/reference/access-modifiers.md`.
+- **Compile-error notes (validated):**
+  - `include { ... } extend { rename: A is B }` errors with `Can't find field 'B' to set access modifier`: `include` ran before the rename freed the name.
+  - `include { internal: X } extend { measure: X is ... }` errors with `Cannot redefine 'X'` because internal columns and measures share a namespace - Malloy disallows shadowing even for `internal`-tagged columns. This collision is the usual reason a `rename:` is introduced: rename the raw column out of the way (`rename: raw_X is X`), then `measure: X is raw_X.sum()`.
+- **See:** `.claude/skills/malloy-gotchas-modeling/SKILL.md` § Field Management: `extend {}` and `include {}`, in that order · `malloy-model/reference/access-modifiers.md` (for the `include {}` capability tradeoffs)
+
+---
+
+## C-09: `count()` vs `count(field)`
+
+- **Severity:** major · **Category:** correctness-aggregation · LLM-judgment
+- **Detection:** when a measure name suggests counting a specific entity (`unique_customers`, `distinct_products`) but uses `count()` on a source whose grain is something else, flag
+- **Fix:** `count()` for rows; `count(x)` for distinct values of x. Make the measure name match the grain.
+- **See:** `.claude/skills/malloy-gotchas-modeling/SKILL.md` (count semantics referenced throughout; weak counterpart, relies on reviewer judgment about measure-name-vs-grain mismatch)
+
+---
+
+## C-10: Use Malloy native patterns when available
+
+- **Severity:** major (non-blocking) · **Category:** correctness-syntax · LLM-judgment
+- **Detection:** find every `conn.sql(` occurrence, then **analyze the embedded SQL**:
+  1. Read the SQL string.
+  2. **MANDATORY pre-check, schema verification.** Use `execute_query` to run `run: <table_path> -> { select: * limit: 1 }` against the underlying table referenced in the SQL. Compare the table's column list to the SQL's `SELECT` list. **Any column in the table that's NOT in the SELECT was being intentionally hidden by the SQL.** If so, the migration must preserve gating via `extend { except: ... }`, NOT just swap `sql()` → `table()`. Especially watch for columns named `month_*`, `weekly_*`, `daily_*`, `total_*`, `cum_*`, `running_*`, or anything matching `(month|day|week|hour)_<measure>`, these are typically pre-aggregated per-period rollups that would silently double-count if exposed and summed.
+  3. Identify constructs used: `SELECT`, `GROUP BY`, `JOIN`, `CASE WHEN`, window functions (`LAG`, `LEAD`, `ROW_NUMBER`, `RANK`, `OVER`), CTEs, lateral joins, UNNEST, PIVOT, latest-snapshot subqueries, DB-specific functions, column aliases (`X AS Y`).
+  4. **MANDATORY: call `search_malloy_docs` for each non-trivial construct**, window functions, CTE chains, UNNEST/array access, PIVOT and conditional aggregation, latest-snapshot lookups. "When unsure" historically read as "never", agents skipped this step and asserted `conn.sql()` was justified when in fact Malloy expressed the pattern fine. The skip is not allowed. Record the search queries you ran inline in the finding's `suggested_fix` so the user can audit them.
+  5. **If every construct has a Malloy equivalent** → flag, with a sketched rewrite that includes the preserved gating clause.
+  6. **If any construct genuinely requires raw SQL** → don't flag, but the genuine-requirement list is narrow (DML/DDL, certain `MERGE` patterns). Do not accept "Malloy can't express this cleanly" without citing a specific `search_malloy_docs` query that returned no equivalent.
+- **Common mappings the agent should know:**
+  - `SELECT col, AGG(...) FROM x GROUP BY col` → `x -> { group_by: col; aggregate: ... is ... }`
+  - `SELECT explicit_cols FROM x` (column gating) → `x extend { except: <columns_not_in_SELECT> }` or `accept: <columns_in_SELECT>`
+  - `SELECT col_x AS col_y FROM x` → `extend { rename: col_y is col_x }`
+  - `SELECT CAST(ROUND(a * b) AS INT64) AS total FROM x` → `extend { dimension: total is round(a * b)::number }`
+  - `WHERE created_at > '2024-01-01'` → `extend { where: created_at > @2024-01-01 }`
+  - `LAG/LEAD/ROW_NUMBER/RANK ... OVER (...)` → `calculate: ... is lag(...)`, `rank()`, etc.
+  - **`SUM(x) OVER (PARTITION BY ... ORDER BY ... ROWS UNBOUNDED PRECEDING)`** → `calculate: c is sum_cumulative(x) { partition_by: ...; order_by: ... asc }`
+  - **`SUM(x) OVER (... ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)`** (cumulative-excluding-current) → `sum_cumulative(x) - x` with the same `partition_by`/`order_by`
+  - **Multi-CTE pipelines** → stacked query-based sources: `source: a is t -> {...}`; `source: b is a -> {...}`
+  - **UNNEST / array access** → an array of records is read by its field path (`group_by: ys.yr`, `aggregate: tv is ys.v.sum()`); an array of plain values is read with `.each` and nothing after it (`group_by: v is arr.each`). `array_column.each.field` does not exist ([data types docs](https://docs.malloydata.dev/documentation/language/datatypes#array-access))
+  - **PIVOT / `SUM(CASE WHEN cat = 'a' THEN x END)`** → filtered aggregates: `aggregate: a is x.sum() { where: cat = 'a' }`
+  - **`WHERE date = (SELECT max(date) FROM …)`** (latest snapshot) → `join_cross` to a one-row aggregate source, then filter on the joined `max_date` field
+  - **Multi-key joins (`ON a.x = b.x AND a.y = b.y`)** → `join_one: b on x = b.x and y = b.y`
+  - `CASE WHEN ... THEN ... ELSE ... END` → `pick ... when ... else ...`
+  - `GREATEST(a, b)` / `LEAST(a, b)` → native: `greatest(a, b)` / `least(a, b)` (work as Malloy dimensions, no `conn.sql()` needed)
+  - `COALESCE(a, b)` → `a ?? b`
+  - `CAST(x AS y)` → `x::y`
+  - Dialect-specific scalar functions Malloy doesn't model → `function_name!return_type(args)` (raw-SQL function escape; does NOT require `conn.sql()`)
+- **The `rename:` chain pattern.** When the original SQL re-used column names via a swap (e.g., `SELECT cash_month AS payment_date, payment_date AS payment_day`), Malloy supports the same swap as two ordered `rename:` clauses: `rename: payment_day is payment_date` (frees the name), then `rename: payment_date is cash_month` (re-uses it). Malloy evaluates renames in source-block order. (`rename:` works inside `extend {}` alongside `except:` / `accept:`, and composes with `include {}` provided the renaming `extend {}` comes first - see C-06.)
+- **Fix:** propose the equivalent Malloy when expressible, **preserving the column gating** discovered in the pre-check step. When not expressible, the rule doesn't fire, leave `conn.sql()` alone.
+- **Worked cautionary example:** A reviewer once tier-classified a 6-CTE 148-line `sql()` block (forecast pipeline with multi-key joins, latest-snapshot, custom-frame window function, conditional pivot, transfer-math `GREATEST/LEAST` chains) as "justified, Malloy can't express the window function with `ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING` cleanly." They never called `search_malloy_docs`. After actually searching, the equivalent is `sum_cumulative(x) - x { partition_by: ... }`, eight lines. The port came out 160 lines (12 more than the SQL), byte-identical across 2,160 cells of test data. The "Malloy can't do this" intuition was wrong, and the cost was duplicated review work plus several years of avoidable `conn.sql()` maintenance burden. **If you (the reviewer) catch yourself writing "this is awkward in Malloy" without having searched, stop and search.**
+- **See:** `.claude/skills/malloy-gotchas-modeling/SKILL.md` § Never Use `conn.sql()` When Malloy Has a Native Pattern (canonical equivalence table) · `.claude/skills/malloy-gotchas-modeling/SKILL.md` § Field Management: `extend {}` and `include {}`, in that order
+
+---
+
+## C-12: Declared `primary_key:` must actually be unique in the data
+
+- **Severity:** critical (blocking) · **Category:** correctness-join · machine-checkable (data-driven)
+- **Detection:** SKILL.md step 3 runs `execute_query` for each source with a declared `primary_key:` and merges the result into `source_index.<src>.pk_verified` as `true | false | "skipped" | "error"`. **Emit C-12 only when `pk_verified == false`**, the source's declared PK has duplicates in the data. When `pk_verified` is `"skipped"` or `"error"`, do not emit; note the diagnostic-coverage gap in the output's Scope section instead.
+- **Why this matters:** Malloy's symmetric-aggregation SQL relies on `HASH(pk) * 1e15` being unique per row. If the PK is a lie, the `DISTINCT` step collapses what shouldn't, and aggregations across `join_one:` to this source return hash-collision-sized garbage (~10²¹). The filter that "fixes" the symptom is doing so accidentally, by happening to produce a uniquely-keyed subset.
+- **Fix template:** three paths:
+  1. Pick a different (or composite) PK that *is* unique. For composite keys in Malloy, derive a single dimension that concatenates the key columns (`row_key is concat(acct::string, '-', mon::string)`) and use that as `primary_key:`. Never choose the column with the most distinct values: if it repeats, the key is still wrong.
+  2. Add a source-level `where:` that makes the existing PK unique within the filtered set (acceptable when the filter is the source's intended scope).
+  3. Declare a `given:` with **no default** for the discriminating column and pin it in the source's `where:` (e.g. `given: EVENT_DATE :: date` and `where: event_date = $EVENT_DATE`), so every query must supply it. Do not suggest `#(filter) … required`: `#(filter)` is deprecated.
+- **See:** `malloy-model/reference/bridge-tables.md` § Cardinality Verification · `malloy-model` § Parameterizing sources with `given:` (for the required-given remediation path)
+
+---
+
+## Detection guidance for the correctness reviewer
+
+1. **Consume diagnostics first**, SKILL.md step 2 already mapped IDE diagnostics to findings with `source: "diagnostic"`. Parse errors, syntax errors, missing colons, missing arrows, unbacked reserved words, redefined columns, all the compiler's job. Don't re-emit; don't add rubric rules for compile-caught problems.
+2. **Focus on silently-wrong behavior.** Every rule here is a case where the code compiles but is semantically incorrect.
+3. **Work from the rubric, not from intuition**, only emit findings that map to a rule ID here. If you see a semantic problem that doesn't match any rule, emit it as `rule: "judgment"` and explain it.
+4. **Emit nothing if the rule doesn't fire.** The output should feel curated, not exhaustive.

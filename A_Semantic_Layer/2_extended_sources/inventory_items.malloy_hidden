@@ -1,0 +1,7 @@
+
+import '../1_sources/inventory_items.malloy_hidden'
+
+
+source: inventory_items is inventory_items_source extend {
+
+}

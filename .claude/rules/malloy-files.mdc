@@ -1,0 +1,148 @@
+---
+description: Constraints for editing Malloy model and notebook files
+globs: ["**/*.malloy", "**/*.malloynb"]
+---
+
+## Syntax Rules
+
+- Use `is` not `as`: `dimension: name is expression`
+- Backtick reserved words: `` `Date` ``, `` `Hour` ``, `` `Type` ``, `` `source` ``, `` `year` ``, `` `month` ``, `` `number` ``, `` `string` ``, `` `boolean` ``, `` `order` ``, `` `table` ``, `` `time` ``, `` `index` ``, `` `window` ``, `` `range` ``, `` `row` ``, `` `current` `` — when in doubt, backtick it. See CLAUDE.md for full list.
+- Never use `rename:` — incompatible with `include {}`. Use `internal:` + `dimension:` instead (e.g., mark `` `Type` `` as `internal`, add `dimension: order_type is \`Type\``)
+- Safe division: `revenue / nullif(order_count, 0)` - ALWAYS use nullif
+- NULL checks: use `is not null` (not `!= null`)
+- Date functions: `day_of_week(date)` not `date.day_of_week`
+- Boolean comparisons: `= true` not `= 'true'` (no quotes)
+
+## View Constraints
+
+- Create 2-3 views max initially, then ask user what else they need
+- Charts render ONLY the first aggregate — use exactly ONE aggregate per chart view. For multiple metrics, omit chart annotation (table) or use separate views in a `# dashboard`
+- Alias joined fields before using in `order_by`: `group_by: yr is table.year` then `order_by: yr`
+
+## DRY: Source-Level Definitions Only
+
+Do NOT define measures or dimensions inline inside views. Define them in the source, then reference by name in views. This keeps definitions reusable and avoids duplication.
+
+```malloy
+// ❌ WRONG - inline in view
+view: summary is { aggregate: revenue is sum(total) }
+
+// ✅ RIGHT - defined in source, referenced in view
+measure: revenue is sum(total)
+view: summary is { aggregate: revenue }
+```
+
+## Source Order
+
+Define joined/lookup tables BEFORE the source that references them. Errors cascade if out of order.
+
+```malloy
+// CORRECT ORDER
+source: customers is conn.table('customers') extend { primary_key: id }
+source: orders is conn.table('orders') extend {
+  join_one: customers with customer_id  // Works because customers defined first
+}
+```
+
+## Error Handling
+
+- Fix the FIRST error only - errors cascade
+- 20+ random errors? Check for unbackticked reserved words (`number`, `Date`, `Type`, `source`)
+- Search for and read `**/malloy-debug/SKILL.md` for detailed troubleshooting
+
+## Aggregate Filters
+
+- `where:` filters rows BEFORE aggregation (use for dimensions)
+- `having:` filters AFTER aggregation (use for measures)
+
+```malloy
+// WRONG: where: order_count > 10
+// RIGHT: having: order_count > 10
+```
+
+## Formatting for Readability
+
+- One tag per line — `# label="Revenue"` and `# currency` must be on separate lines above the field (never combined on one line)
+- Use `# currency` (no fixed scale) on measure definitions — fixed scale like `usd0m` only in views after confirming value ranges
+- Large counts: `# number=auto` → auto-scales to K/M/B
+- Summary with few aggregates: use `# big_value`, `# transpose`, or `# dashboard`
+- KPI cards: `# big_value` with `# label="..."` on each measure
+- One aggregate per chart view (charts ignore all but the first)
+
+## Documentation Tags
+
+- Tag ordering (when multiple tags on a field): `#(index)` → `#(doc)` → render tags (`# currency`, `# label`, etc.) → field name. Blank line between each field group.
+- `#(doc)` - Description for Credible AI discovery. Write for retrieval: use business meaning, not Malloy jargon. Avoid "filterable", "groupable", "dimension", "measure".
+- `#(doc)` on views - Document what the view shows: `#(doc) Monthly revenue trend for tracking growth`
+- `#(index)` - Index field values for Credible AI search. Err on the side of over-indexing — un-indexed dimensions are hard for users to find. Candidates: searchable enum/string values users would mention in queries (not booleans, numbers, or IDs). Validate with `index: *`; confirm high-cardinality fields with user. No effect on internal/private fields.
+- `# currency` - ONLY for monetary values (not counts or points)
+
+## Access Modifiers (Experimental)
+
+Enable with: `##! experimental.access_modifiers`
+
+**Every column must be explicitly declared** in `include {}` — `public:` with `#(doc)` or `internal:`. Do not use `public: *`.
+
+**Access levels:**
+- `public:` - Can query directly, accessible through joins
+- `internal:` - Blocks direct queries, join path access, and `where:` filters. Allows `extend {}` definitions (so you can create a public dimension from an internal field).
+- `private:` - Only in defining source, not accessible anywhere else
+
+**⚠️ GOTCHA:** `include { except: a, b }` without explicit `public:` declarations makes remaining fields **private**, not public. Always list columns explicitly.
+
+**What to mark `internal` (verify via index query + confirm with user first):**
+- Empty/garbage columns (confirmed no useful data)
+- Raw JSON/array blobs (when all useful fields extracted as dimensions)
+- Duplicate columns where only one is correct
+- Raw columns replaced by a derived dimension (e.g., raw `` `Report Received Date` `` when `recall_date` dimension exists)
+
+**What to mark `private` (only after user confirms — very rare):** Highly sensitive data only (SSNs, raw credit card numbers, passwords). Do NOT assume email/phone are private — ask first.
+
+**Include pattern:**
+```malloy
+// Explicit column listing (every column declared)
+source: orders is conn.table('orders')
+include {
+  public:
+    #(doc) Order identifier
+    order_id
+
+    #(doc) Customer foreign key
+    user_id
+
+    #(doc) Sale price in USD
+    sale_price
+
+  internal:
+    raw_payload_json  // Verified empty via index query
+}
+extend { join_one: users with user_id }
+```
+
+**Include positioning:**
+- `include { } extend { }` - New definitions are PUBLIC
+- `extend { } include { }` - Include covers everything
+
+## Query-Based Sources
+
+Do NOT use `conn.sql()` when Malloy has a native pattern. Use query-based sources for pre-aggregation and window functions:
+
+```malloy
+// Pre-aggregation
+source: facts is conn.table('orders') -> { group_by: user_id, aggregate: total is sum(amount) } extend { ... }
+
+// Window functions
+source: seq is conn.table('orders') -> {
+  group_by: order_id, user_id
+  aggregate: order_time is min(created_at)
+  calculate: rank is row_number() { partition_by: user_id, order_by: order_time }
+} extend { ... }
+```
+
+**Cannot redefine** columns from query-based sources — they already exist as fields. Add only NEW derived dimensions in `extend {}`.
+
+## Notebooks (.malloynb)
+
+- Compile errors NOT shown in linter - only visible on cell execution
+- Define filter dimensions in MAIN source, not joined sources
+- Use `+` for view refinement: `run: source -> view + { limit: 10 }`

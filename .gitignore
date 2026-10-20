@@ -1,0 +1,17 @@
+# ---- Credentials / secrets ----
+malloy-config.json
+.env
+.env.*
+
+# ---- Local data ----
+*.duckdb
+*.duckdb.wal
+*.db
+*.parquet
+publisher_data/
+publisher.db*
+
+# ---- Local tooling state ----
+.mcp.json
+.vscode/mcp.json
+.DS_Store

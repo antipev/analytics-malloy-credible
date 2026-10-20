@@ -1,0 +1,379 @@
+---
+name: malloy-model
+description: Build Malloy semantic models with base source and joined source files. Use when creating or modifying .malloy files, user asks to "create a malloy model", "add dimensions", "add measures", "create a source", or any Malloy model authoring task.
+version: 0.1.41
+---
+<!--
+Copyright (c) Credible Data Inc.
+SPDX-License-Identifier: MIT
+-->
+
+# Building Malloy Models
+
+> **Tool names** are written bare here - `get_context`, `execute_query`, `search_malloy_docs`. The exact prefixed name depends on the host surface; match each against the tools you actually have.
+
+## Getting Started (New Projects)
+
+If no `.malloy` files exist yet, do discovery and propose a structure first, then return here to build base source and joined source files. Keep proposals and the analysis behind them in the conversation.
+
+**File structure convention** (a flat layout at the package root is the simplest default):
+```
+<package-name>/
+  publisher.json              # Required for publishing (name, version, description)
+  customers.malloy            # Base source: one per table
+  products.malloy
+  orders.malloy
+  user_order_facts.malloy     # Computed source
+  order_analysis.malloy       # Source: one per analytical domain
+  customer_health.malloy
+```
+
+Versions for new packages should start at "0.0.1".
+
+**Before creating any files**, check for an existing `publisher.json` in the target directory. If one exists for a different package, create a new subdirectory for your package, don't overwrite another package's config.
+
+In Publisher an environment is a project, and Publisher is single-tenant, so there is no org/tenant layer to model around: one environment holds one set of packages.
+
+## Prior Art Dispatch
+
+If your discovery turned up existing modeling patterns to mirror (a derived table, UNNEST joins, a review or curation pass), read the relevant reference before building.
+
+| Pattern found in prior art | Reference to read |
+|---------------------|-------------------|
+| Derived table (PDT/NDT) | `.claude/skills/malloy-lookml-review/SKILL.md` build-derived-tables guidance |
+| UNNEST joins or struct access | `.claude/skills/malloy-lookml-review/SKILL.md` build-unnest guidance |
+| Review pass for coverage | `.claude/skills/malloy-lookml-review/SKILL.md` review-coverage guidance |
+| Curate pass with visibility seeds | `.claude/skills/malloy-lookml-review/SKILL.md` curate-visibility guidance |
+
+## Base Source Templates
+
+### Base Source (Simple Mode)
+
+```malloy
+source: customers is my_conn.table('sales.customers')
+extend {
+  primary_key: customer_id
+
+  dimension:
+    // A dimension is the lighter way to give a column a cleaner name
+    order_type is `Type`
+    full_name is concat(first_name, ' ', last_name)
+    segment is lifetime_value ?
+      pick 'enterprise' when >= 100000
+      pick 'mid-market' when >= 10000
+      else 'SMB'
+
+  measure:
+    customer_count is count()
+}
+```
+
+> **Every `dimension:` needs `name is expr`.** A bare column name like `dimension: species` is a parse error (`unexpected '}'`, or `missing 'is' before 'measure:'` when another declaration follows). Raw columns are already usable in `group_by` / `select` without any declaration, so only add a `dimension:` when deriving or renaming a field (e.g. `revenue is price * quantity`).
+
+### Base Source (Curated Mode with Access Modifiers)
+
+```malloy
+##! experimental.access_modifiers
+
+source: orders is my_conn.table('sales.orders')
+include {
+  public:
+    #(doc) Order identifier
+    order_id
+
+    #(doc) Customer who placed the order
+    user_id
+
+    #(doc) Total sale price in USD
+    sale_price
+
+    #(doc) Order creation timestamp
+    created_at
+
+  internal:
+    raw_payload_json  // Verified empty via index query + user confirmation
+}
+extend {
+  primary_key: order_id
+
+  dimension:
+    #(doc) Date the order was placed
+    order_date is created_at::date
+
+  measure:
+    #(doc) Total number of orders
+    order_count is count()
+
+    #(doc) Total revenue in USD
+    # currency
+    revenue is sum(sale_price)
+}
+```
+
+### Computed Source (from Query)
+
+Wrap the query in parentheses and extend it. `from(...)` was removed from the language and no longer parses (`unexpected 'from'`).
+
+```malloy
+import "orders.malloy"
+
+source: user_order_facts is (
+  orders -> {
+    group_by: customer_id
+    aggregate:
+      total_orders is count()
+      total_revenue is sum(sale_price)
+      first_order_date is min(created_at)
+      last_order_date is max(created_at)
+  }
+) extend {
+  primary_key: customer_id
+
+  dimension:
+    days_since_last_order is days(last_order_date to now)
+    is_repeat_buyer is total_orders > 1
+
+  measure:
+    buyer_count is count()
+    avg_customer_ltv is avg(total_revenue)
+}
+```
+
+For advanced query-based source patterns (window functions, pipelines), see `reference/query-sources.md`.
+
+## Joined Source File Template
+
+```malloy
+import "customers.malloy"
+import "orders.malloy"
+import "user_order_facts.malloy"
+
+#(doc) Customer health analysis. Use for retention, segmentation, and churn risk.
+source: customer_health is customers extend {
+  join_one: user_order_facts with customer_id
+  join_many: orders on customer_id = orders.customer_id
+
+  dimension:
+    is_at_risk is user_order_facts.days_since_last_order > 90
+      and user_order_facts.total_orders > 1
+
+  measure:
+    revenue_per_customer is orders.sale_price.sum() / nullif(customer_count, 0)
+    at_risk_count is count() { where: is_at_risk = true }
+}
+```
+
+## Base vs Joined Sources
+
+| | Base Joined Source File | Joined Source File |
+|---|---|---|
+| **Contains** | One table's fields | Joins between base sources |
+| **Dimensions** | Intrinsic to this table only | Cross-source (require joins) |
+| **Measures** | Single-table aggregations | Cross-source aggregations |
+| **Joins** | None (or only lookup joins intrinsic to the source) | Defines relationships between base sources |
+| **Views** | None, in schema-first (see below) | None, in schema-first (see below) |
+| **One per** | Physical table or computed source | Analytical domain |
+
+**The "no views" rule is schema-first only.** A schema-first model is built before anyone
+has asked a question, so any view in it is a guess. It does **not** apply to the
+analysis-first workflow (`.claude/skills/malloy-model/SKILL.md-as-you-go`), where every view is a
+question that was asked and verified - there, **saving a view or a dashboard is the right
+call**, in the model file next to the measures it uses. Analysis-first still models
+everything else properly: documented dimensions, measures, and joins.
+
+**Two more rules here are schema-first only.** Analysis-first should skip access modifiers
+and curation - there is no discovery surface to curate when every field was paid for by a
+question - and skip one-file-per-table, keeping a single domain file until it genuinely
+gets unwieldy.
+
+## Key Rules
+
+- **Every `dimension:` needs `name is expr`**: a bare `dimension: species` is a parse error. Raw columns are queryable directly in `group_by` / `select`; only declare a `dimension:` to derive or rename a field.
+- **Define joined tables before referencing them**, use `import` statements in multi-file architecture
+- **Use `nullif(denominator, 0)` for all division**
+- **Alias joined fields before using in `order_by`**: `group_by: yr is table.year`
+- **Verify join paths** exist before referencing `a.b.field` (each hop needs explicit join)
+- **Pick syntax**: value BEFORE condition, `pick 'Small' when size < 10`
+- **`where:` vs `having:`**: Use `where:` for row filters, `having:` for aggregate filters
+- **`rename:` composes with `include {}`, but only in one order**: the `extend { rename: }` must come before the `include {}`, which then names the field by its new name. Reversed, it fails with `Can't find field 'X' to set access modifier`. For a cleaner column name without a rename, `internal:` + `dimension:` is still the lighter move (mark `` `Type` `` as `internal`, add `` dimension: order_type is `Type` ``). See `.claude/skills/malloy-gotchas-modeling/SKILL.md` § Field Management
+- **Mark raw columns `internal` when a derived dimension replaces them**
+- **Check for duplicate rows** before building measures
+- When both a combined table (all types) and filtered/split tables exist, prefer the split tables
+- **DRY: define measures/dimensions in base source files, not inline in views**
+- **Lay out a new file the same way throughout**: two-space indentation, no tabs, one blank line between top-level declarations (consecutive `import` lines stay together), no trailing whitespace, and a long line broken after a comma or before an operator, at whatever width the project keeps to. In a project whose files already use another layout (tabs, four spaces), a new file matches them.
+- **An edit keeps the file's own layout**: change only the lines the request needs, and never reindent or rewrap a line you weren't asked to change, so the diff shows the change and nothing else.
+- **Never write a threshold, tier boundary, or bucket cutoff you chose yourself.** Every boundary in a `pick` expression or filtered measure is user-supplied, distribution-derived (query `min`/`p25`/`p50`/`p75`/`p95` first and show the evidence; Malloy has no `percentile` function, so use the two-stage query in `.claude/skills/malloy-discover/SKILL.md` § Example Queries; see `.claude/skills/malloy-define/SKILL.md` § Data-driven proposals), or explicitly flagged as an assumption in its `#(doc)`. A hardcoded cutoff nobody confirmed is a business decision shipped as fact.
+
+## Parameterizing sources with `given:` (preferred)
+
+Native Malloy **`given:` parameters** are runtime values a model reads in its own logic; callers supply them at query time. `#(filter)` is deprecated: never add one. Enable givens with `##! experimental.givens` at the top of the model.
+
+**A given belongs in the model only when the data's meaning or access depends on it:**
+
+- a row-level gate: `#(authorize)`, `#(access_filter)`, a `#(secure)` given, `$GROUPS`;
+- a value every query must supply (the no-default row in the table below);
+- a parameter a measure, dimension or view is defined with;
+- scoping the author means to apply to every consumer of the source: chat, MCP and every report.
+
+**A filter a reader picks on a dashboard or notebook is not modeling.** Manufacturer, a date range, region, a "major recalls only" toggle: don't add it to a source. Leave the source unfiltered, and let the report declare the given and bind it on its tiles (`.claude/skills/malloy-reports/SKILL.md`). A model-level `where:` applies to every read of the source, chat and every other report included, and a report cannot take it over, because binding is per declaration, not per name. The report builder shows such a filter but cannot remove or reconfigure it.
+
+```malloy
+##! experimental.givens
+
+# A value every query must supply: the table is partitioned by day.
+given: EVENT_DATE :: date
+
+source: events is duckdb.table('data/events.parquet') extend {
+  where: event_date = $EVENT_DATE
+  measure: event_count is count()
+}
+```
+
+A given is **declared bare** but **referenced with a `$` sigil** in expressions (`$EVENT_DATE`), as above.
+
+- **An optional given in the model gets a neutral, match-all default** (a `filter<>` given defaulting to `f''`), so an unsupplied value returns unfiltered rows. Because it bakes an always-on `where:` into the source, a non-neutral default (a date floor, say) applies to *every* read of the source. Defaults must be Malloy literals.
+- **Givens don't auto-inject a `where:`.** Unlike `#(filter)`, you write the filter expression that references the given yourself (e.g. `where: dimension ~ $given_name`).
+- **Every `#(filter)` use has a `given:` form.** Never add a `#(filter)` annotation to a model, not even for `required`, `implicit`, or a date/number range:
+
+| You want | Write this | Not this |
+|---|---|---|
+| An optional value or list filter a reader picks | In the **report**, not the model: `given: REGION :: filter<string> is f''` there, bound on its tiles with `+ { where: region ~ $REGION }` (`.claude/skills/malloy-reports/SKILL.md`). In the model only for one of the cases above. | `#(filter) dimension=region type=in` |
+| A date or number range a reader picks | In the **report** the same way: `given: MIN_SALE :: filter<number> is f''` (or `filter<date>`), bound with `+ { where: sale_price ~ $MIN_SALE }`. The caller sends a filter expression such as `>= 50`. | two `#(filter)` lines, `greater_than` and `less_than` |
+| A value every query must supply (the primary key is only unique within it, or the table is too big to scan whole) | a given with **no default**, e.g. `given: EVENT_DATE :: date` and `where: event_date = $EVENT_DATE`. A query that omits it fails with "Given 'EVENT_DATE' has no value and no default". | `#(filter) ... required` |
+| A row filter the system applies, not the caller | `#(access_filter) org_id in $ORG_IDS`, with `ORG_IDS` set by a trusted tier (see the trust caveat below) | `#(filter) ... implicit` |
+
+- **Across files, a given travels by name.** A file that imports another reaches a given only by importing it: a whole-file `import "x.malloy"` brings every given `x.malloy` declares, and a selective `import { src } from "x.malloy"` brings only what it names. The source still compiles either way, because Malloy carries the declaration underneath, but a caller can set only a given the entry model has in scope. In a package curated with `index.malloy`, that means `index.malloy` imports the declaring file whole or names the given in its selective import. Imports don't chain: a given the declaring file itself imports from elsewhere has to reach `index.malloy` too.
+
+Givens are also the substrate for access control - see "Access Control: `#(authorize)` and `#(access_filter)`" below.
+
+## Legacy: reading an existing `#(filter)` model
+
+`#(filter)` is deprecated. Do not add one, and do not copy one from an existing model into a new source. This section is here so you can read, call, and migrate a model that already has them.
+
+Publisher parses the annotation, lists the filters in the API, and **injects a `where:` clause server-side** when a caller passes a value (`filterParams` / `filter_params`). The annotation sits above the `source:` line:
+
+```malloy
+#(filter) [name=NAME] dimension=DIMENSION type=TYPE [implicit] [required]
+```
+
+| Part | Meaning |
+|------|---------|
+| `name` | The API parameter key. Defaults to the dimension name. |
+| `dimension` | The dimension the filter targets. |
+| `type` | `equal` (`=`), `in` (any of several values), `like` (`~ '%value%'`), `greater_than` (`>`, exclusive), `less_than` (`<`, exclusive). |
+| `required` | The server returns 400 when a query supplies no value. |
+| `implicit` | Hidden from the UI and the API filter list. |
+
+Publisher formats the value from the dimension's type (`'value'`, bare `true`/`false`, `@YYYY-MM-DD`), so a caller passes it unquoted.
+
+`#(filter)` is not a security boundary. A caller skips it with `bypass_filters=true` (REST) or `bypassFilters: true` (POST body), or by writing their own query text. Use givens with `#(authorize)` / `#(access_filter)` for access control.
+
+**To migrate** a source, replace each annotation using the table above, then delete it. An optional filter (`type=in`, `like`, `equal`, a range) moves to the reports that offer it, declared and bound there, and the source is left unfiltered; a `required` one stays in the model as a no-default given. `type=greater_than` and `type=less_than` are exclusive, so a plain comparison you convert one to is `>` or `<`, not `>=` or `<=`. `docs/givens.md` § "Coming from `#(filter)`" has a worked conversion.
+
+## Access Control: `#(authorize)` and `#(access_filter)`
+
+Gate query access to a source over declared `given:` values (`given:` is Malloy's native runtime-parameter mechanism, the going-forward replacement for `#(filter)`). **Two annotations, one question each, and the name tells you which:**
+
+| Annotation | The question | Body it takes | A denial is |
+| --- | --- | --- | --- |
+| `#(authorize)` | may this caller reach this source at all? | `'literal' <op> $GIVEN`, plus the `true`/`false` sentinels | **403** |
+| `#(access_filter)` | which rows may they see, once they may? | `field_path <op> $GIVEN` | **200**, with their rows |
+
+Either is an annotation on its own line directly above the `source:` line, carrying a **narrow grammar publisher parses itself, not an arbitrary Malloy expression**: one or more terms joined only by `and`, with `<op>` fixed by the given's declared arity (`in` for a list, `=` for a scalar).
+
+**Nothing is inferred from the body.** The annotation you write declares which question you are answering, and a body that does not fit is refused at load naming the other annotation. A source with no annotation of either kind, own or inherited, is unrestricted.
+
+The lock is DECIDED, before the caller's query compiles: a caller it does not admit gets a 403, never a row count or a `NULL` aggregate over data they were refused. The filter is GRAFTED onto the query as a `where:`, so a caller it matches nowhere gets a 200 with an empty result. The lock runs first; a caller it refuses never reaches the filter. A 403 also covers either gate failing to apply at all (a field the entry point dropped, a given nobody supplied).
+
+```malloy
+##! experimental.givens
+
+given:
+  ROLE :: string
+  ORG_IDS :: string[]
+
+#(authorize) 'analyst' = $ROLE
+#(access_filter) org_id in $ORG_IDS
+source: orders is duckdb.table('orders.parquet') extend {
+  measure: order_count is count()
+}
+```
+
+- **Nothing outside the two term shapes above parses.** No `or`, `not`, `!=`, `<`/`>`/`<=`/`>=`, function calls, bare field/boolean references, or a literal on the right of a row-level term. `org_id in $GROUPS` and `region = $REGION and org_id in $GROUPS` are legal; `upper(region) = $REGION`, `(org_id in $GROUPS or region = $REGION)`, and a bare `#(access_filter) authorized` are all refused at load with a named cause (see your deployment's reference documentation for the full list).
+- **Writing a term on the wrong annotation is refused, both ways.** `#(authorize) org_id in $GROUPS` is refused naming `#(access_filter)`; `#(access_filter) 'finance' in $GROUPS` is refused naming `#(authorize)`. The second matters: a constant predicate grafted as a row filter would serve a refused caller 200 with zero rows, which is the answer the lock exists to replace.
+- **A source may declare more than one note on a route: repeats AND together.** `#(access_filter) region = $REGION` stacked with a second `#(access_filter) org_id in $GROUPS` both apply, and a caller must satisfy every term across every note. `or` is still refused wherever it appears, so there is no way to spell "admit if either" inside one gate or across a source's gates; use two extension sources instead, one per admitted population (see the admin pattern below).
+- **Two exceptions to "every term references a given", and both live on the lock.** `#(authorize) false` is a deny-all: that is how you lock a base. `#(authorize) true` is an admit-all, and it is what an extension of a locked base needs in order to be open: a source declaring no gate of its own **inherits** its ancestor's, so leaving the annotation off an extension of a `false` base inherits the lock rather than lifting it. Neither sentinel is legal on `#(access_filter)`. `false` may not share a source with another note at all; `true` may not share the lock route with one, but is live beside an `#(access_filter)` (`#(authorize) true` with `#(access_filter) org_id in $GROUPS` re-opens a locked base while still scoping the rows). Neither is a term: `true and org_id in $GROUPS` is read as an ordinary two-term body whose first term is malformed.
+- **Inheritance is per route.** Both inherit through `extend` the same way, own wins over ancestor on that route only, so a source can be "own" for one and "inherited" for the other. The API reports them separately, each under the field named for its own annotation: `Source.authorize` and `Source.accessFilter`.
+- **Generate the admin escape hatch as another extension over the locked base, never as a bypass.** When a model needs an ordinary population plus a wider one, add a second extension whose rule is a lock on the caller:
+
+```malloy
+given:
+  ORG_IDS :: string[]
+  GROUPS  :: string[]
+
+#(authorize) false
+source: orders_base is duckdb.table('orders.parquet') extend {}
+
+#(authorize) true
+#(access_filter) org_id in $ORG_IDS
+source: orders is orders_base extend {}
+
+#(authorize) 'admin' in $GROUPS
+source: orders_admin is orders_base extend {}
+```
+
+  Each extension replaces the base's `false` on the lock route with its own rule. `orders` is open to everyone and scoped per row; `orders_admin` is locked to the admin group and, carrying no filter, serves every row to whoever passes. This is the shape to generate whenever an author wants a role to see everything: another extension source, not a flag that skips the gate.
+- **Both only gate from the `source:` line.** The same annotation on a `dimension:`/`measure:`/`join_*:`/`view:` line, or on a top-level `query:`, is refused at load naming the position rather than silently protecting nothing.
+- **Every given the gate references must be declared on the entry model's own surface, and must carry no default.** In a package curated with `index.malloy`, "on the surface" means `index.malloy` imports it: import the declaring file whole, or name the given in a selective import (`import { orders, GROUPS } from "orders.malloy"`). A given the model cannot resolve is refused at load. So is a referenced given declared *with* a default: a caller who supplies nothing would get that default and be admitted or excluded by a value the gate's own line never shows, so it is refused rather than reasoned about case by case.
+- **A scalar/array mismatch between the operator and the given's declared type is a load-time refusal**, not a request-time warehouse error: `org_id in $GROUPS` requires `GROUPS` to be array-typed, `region = $REGION` requires `REGION` scalar. Negation is likewise refused outright, so there is no empty-given inversion surprise to warn about.
+- **Entry point only: not joined, but inherited through `extend`.** The gate applies to the source a query enters through. A gate on a source reached only via `join_*` **never fires**, at any depth, so anything ungated that joins a locked base hands the base's rows to every caller. A source that `extend`s a locked base and declares no gate of its own **does** carry the base's gate; declaring its own annotation replaces it. A source derived from a locked base via a query (`source: z is locked -> { … }`) instead **always carries the base's gate in addition to its own**: the derivation recurses into the base unconditionally, so an own gate does not replace it, and the two combine as separate AND'd entries. Pair a locked base with curated extension sources, using access modifiers (`include { public: …, private: * }`), so an extension re-exposes only a curated column surface, and keep sensitive sources out of ungated joins. A join the *caller* writes in query text is the caller entering the joined source, so that source's gate does apply to it: a lock is decided, a row filter is grafted into the join. That holds for a query source the model declares over an inline `table(...) extend { … }` base as much as for a table source: the join anchors on the declared source, and the derivation carries the base's gate. The author-join side has a contract of its own: when a gated entry source author-joins a tenant-scoped source, carry the tenant key in the `on` (`on list_id = values.list_id and org_id = values.org_id`), because the joined source's gate does not fire through that join and the ON is what keeps the rows to the caller's tenant. Where a join cannot be keyed that way, the entry source's own gate may reference the joined column (`#(access_filter) values.org_id = $ORG_ID`): that is enforced, at the cost of turning that `join_one` into an inner join, so a row with no match drops rather than surviving with nulls.
+- **A derivation that drops a column the gate reads fails CLOSED.** `extend { except: org_id }`, or an `accept:` that omits it, leaves the grafted filter unable to compile, so the request is denied rather than served ungated. The one hole to know: dropping the gated column and then `rename:`-ing a *different* column onto that exact name grafts successfully and binds the gate to the wrong column. Narrow, but real, so don't recycle a gated column's name. If a derivation's own projection needs to drop the column a row-level term would read, use a source-level term (`'literal' in/= $GIVEN`) instead, since it never depends on any projected column.
+- **The quoted-string and file-level forms are refused at load and no longer exist.** A quoted expression on the `source:` line, in either quote, a file-level `##(…) "<expr>"` applying to every source in the file, and the earlier `internal dimension: authorized is <expr>` form are all retired; the load names the rewrite. Every `.malloy` file in a package compiles at load and any failure aborts the package, so a retired-form gate anywhere in the package is refused. Only a declaring file *outside* the package escapes that: it loads and denies every request instead, with no compile-time hint. See your deployment's reference documentation.
+- **A gated source can be persisted, but the gating column freezes.** `storage=` and `#@ preaggregate` refuse a gated source outright; a colocated `#@ persist` is admitted when the gate is provably the entry point's own row filter. The gate still runs live on every query, so rows come back filtered - but the column it filters ON is frozen at build time, so a row whose access decision changes keeps being served under the old decision until the next rebuild. Pair `#@ persist` on a gated source with a freshness window (`fallback="live"`), which is the only control that bounds that - and read `.claude/skills/malloy-materialization/SKILL.md` for where that window binds, because on a standalone Publisher it does not.
+
+> **Trust caveat.** Givens are **caller-asserted**, anyone who can reach the query API can claim a favorable given, e.g. `{"ROLE":"admin"}`. Neither annotation is a real boundary unless it sits behind a trusted tier that sets givens from its own verified context, never directly from an untrusted caller. Neither is, on its own, end-user authentication.
+>
+> **Forward direction.** Givens are how access control is built here, and the planned next step is **identity-bound ("secure") givens** - reserved values a trusted tier populates from a verified token or proxy header, which the caller cannot override - turning these gates into a standalone boundary. Model access on `given:` + these two annotations now; it is the surface that carries forward.
+
+Full syntax, inheritance rules, validation, and the error contract are covered in your deployment's authorize reference documentation.
+
+## Join Syntax
+
+- Simple join: `join_one: users with user_id`
+- Expression join: `join_one: origin is airports on origin_code = origin.code`
+- Composite key: `join_one: items on order_id = items.order_id and product_id = items.product_id`
+- Multiple joins to same table: `join_one: origin_airport is airports with origin`
+
+**Join Types:** `join_one:` (many-to-one, efficient) | `join_many:` (one-to-many, always safe) | `join_cross:` (many-to-many)
+
+**Verify cardinality** before writing joins: `run: target -> { group_by: fk_col, aggregate: n is count(), having: n > 1, limit: 5 }`. 0 results → `join_one`. Any results → `join_many`.
+
+## After Writing: Check & Review
+
+Check diagnostics after writing. Errors cascade, fix the FIRST error only, then re-check. If errors persist, use the debugging strategy: look at first error, search docs if unsure, fix, repeat.
+
+**Validate with `execute_query`:** Run queries, check distributions, verify measures, confirm joins (no fan-out).
+
+To inspect the sources and fields a model already defines, ground yourself with `get_context`. It returns the package's sources, views, and fields, so there is no separate schema-search step. When you're unsure of Malloy syntax, call `search_malloy_docs` rather than guessing.
+
+## Advanced Patterns
+
+Load the relevant reference file when you encounter these scenarios:
+
+| Scenario | Read |
+|----------|------|
+| Need pre-aggregated or windowed source | `reference/query-sources.md` |
+| Curating access modifiers | `reference/access-modifiers.md` |
+| Normalized/ER-style schema (4+ tables, no clear fact table) | `reference/normalized-schemas.md` |
+| Formalizing analysis into a model | `reference/analysis-to-model.md` |
+| Many-to-many / bridge tables / composite keys | `reference/bridge-tables.md` |
+
+## Done
+
+Step complete. Output: base source files (`.malloy`, one per table) and joined source files (`.malloy`, one per analytical domain).
+
+**Suggest next steps to the user**, unless your host's instructions say it shows follow-up suggestions of its own:
+
+- Open the model to see it live. On a local Publisher server that is `http://localhost:4000/<environmentName>/<packageName>` for the package, or `http://localhost:4000/<environmentName>/<packageName>/<modelPath>` for a single model file. First confirm the running server actually serves this package (it is in the loaded `publisher.config.json`, or mounted live with `--server_root . --watch-env <env>`); a package the server has not loaded returns a 404, so do not hand over a link to a package that was just authored but never loaded.
+- Run analysis questions against the model (see `.claude/skills/malloy-analysis/SKILL.md`).
+- When you're ready to serve the model, publishing is out of scope for open-source Publisher v1: self-hosters commit the package to git and use their host's publish path.

@@ -1,0 +1,7 @@
+
+import '..//1_sources/distribution_centers.malloy_hidden'
+
+
+source: distribution_centers is distribution_centers_source extend {
+ 
+}

@@ -1,0 +1,11 @@
+
+import '../0_data/config.malloy_hidden'
+
+#(doc) "A structural metadata source used to facilitate many-to-many joins and unified schema virtualization."
+source: bridge_source is bridge_raw extend {
+  primary_key: Stage
+  
+  rename: 
+    #(doc) "The identifier representing the fact table name (e.g., 'events', 'order_items')."
+    `Stage` is stage
+}

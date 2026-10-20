@@ -1,0 +1,7 @@
+
+import '../1_sources/products.malloy_hidden'
+
+
+source: products is products_source extend {
+
+}

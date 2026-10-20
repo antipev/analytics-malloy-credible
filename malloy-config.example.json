@@ -1,0 +1,19 @@
+{
+    "connections": {
+        "bq_demo": {
+            "connectionUri": "https://maxantipev.data.credibledata.com/api/v0/environments/demo/connections/bq_demo",
+            "accessToken": "<YOUR_CREDIBLE_TOKEN>",
+            "readOnly": true,
+            "is": "publisher"
+        },
+        "duckdb": {
+            "is": "duckdb"
+        },
+        "motherduck": {
+            "connectionUri": "https://maxantipev.data.credibledata.com/api/v0/environments/demo/connections/motherduck",
+            "accessToken": "<YOUR_CREDIBLE_TOKEN>",
+            "readOnly": true,
+            "is": "publisher"
+        }
+    }
+}

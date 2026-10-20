@@ -1,0 +1,9 @@
+##! experimental.access_modifiers
+import '../1_sources/order_items.malloy_hidden'
+
+
+source: order_items is order_items_source include { 
+   *
+   private: users_source 
+   
+}
